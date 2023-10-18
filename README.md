@@ -1,2 +1,2 @@
 # TECHblog_code
-Code snippets and scripts provided in conjunction with the blog posts.
+Code snippets and scripts provided in conjunction with the our Tech Blog, which can be found [here](https://nttdata-dach.github.io).
