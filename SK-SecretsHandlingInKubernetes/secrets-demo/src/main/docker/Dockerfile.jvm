@@ -1,0 +1,8 @@
+FROM amazoncorretto:17.0.8-al2023-headless
+ENV LANGUAGE='en_US:en'
+ENV SECRETVALUE='default_from_image'
+COPY target/secrets-demo-1.0.0-runner.jar secrets-demo-1.0.0-runner.jar
+EXPOSE 8080
+CMD ["java","-jar", "secrets-demo-1.0.0-runner.jar"]
+
+
