@@ -1,6 +1,7 @@
 # Kong – Log Chunking
 by Alexander Suchier
 
-In the [last blog](https://nttdata-dach.github.io/posts/as-kongproductintroduction/), I briefly introduced Kong as a sophisticated API gateway product. This time, I will discuss a problem related to logging message size limitation and offer a solution. This problem significantly limits root cause analysis and ultimately solution development.
+Logging on the Kong API Gateway is currently limited to 4096 character. The LUA module on this repository provides chunking functionality to overcome this limitation. 
+It can be used in all Kong plugins and serverless functions. No more logging information is lost.
 
-Read the full article here (link coming soon)
+For more details read the full article here (link coming soon).
