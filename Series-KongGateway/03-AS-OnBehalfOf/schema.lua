@@ -28,15 +28,24 @@ welcher Art auch immer haftbar zu machen.
 
 local typedefs = require "kong.db.schema.typedefs"
 
-local TOKEN_TYPES = { 
-  "urn:ietf:params:oauth:token-type:jwt", 
-  "urn:ietf:params:oauth:token-type:saml1", 
-  "urn:ietf:params:oauth:token-type:saml2" 
+local TOKEN_TYPES = {
+  "urn:ietf:params:oauth:token-type:jwt",
+  "urn:ietf:params:oauth:token-type:saml1",
+  "urn:ietf:params:oauth:token-type:saml2"
 }
+
+
+local CACHE_KEY_STRATEGY = {
+  "CLIENT_ID_USER_IDENTIFIER",
+  "JWT_ID",
+  "JWT_SIGNATURE"
+}
+
 
 local function validate_resource_scope(config)
   local resource = config.resource
   kong.log.debug("# resource: ", resource)
+
   local scope = config.scope
   kong.log.debug("# scope: ", scope)
 
@@ -46,6 +55,49 @@ local function validate_resource_scope(config)
 
   return true
 end
+
+
+local function validate_cache_strategy(config)
+  local enable_caching = config.enable_caching
+  kong.log.debug("# enable_caching: ", enable_caching)
+
+  local cache_key_strategy = config.cache_key_strategy
+  kong.log.debug("# cache_key_strategy: ", cache_key_strategy)
+
+  if ((enable_caching) and (cache_key_strategy==CLIENT_ID_USER_IDENTIFIER)) then
+    local client_id  = config.client_id
+    local user_identifier_claim = config.user_identifier_claim
+
+    if ((client_id==nil) or (#client_id==0) or (user_identifier_claim==nil) or (#user_identifier_claim==0)) then
+      return nil, "Cache key strategy CLIENT_ID_USER_IDENTIFIER needs a client_id and user_identifier_claim"
+    end
+  end
+
+  return true
+end
+
+
+local function validate(config)
+  local validate = true
+  local errMsg = ""
+
+  local resource_scope, resource_scope_err = validate_resource_scope(config)
+  validate = validate and resource_scope
+
+  if (resource_scope_err) then
+    errMsg = resource_scope_err 
+  end
+
+  local cache_strategy, cache_strategy_err = validate_cache_strategy(config)
+  validate = validate and cache_strategy
+
+  if (cache_strategy_err) then
+    errMsg = errMsg  .. '|' .. cache_strategy_err
+  end
+
+  return validate, errMsg
+end
+
 
 return {
   name = "oauth2-on-behalf-of",
@@ -86,6 +138,7 @@ return {
           -- additional configuration
           { keep_original_token = { type = "boolean", default = false, required = false, description = "Activate, if the input token should be retained in the request (original_authorization)." }, },
           { enable_caching = { type = "boolean", default = false, required = false, description = "Activate, if the token should be cached. Defaults to false." }, },
+          { cache_key_strategy = { type = "string", default = CACHE_KEY_STRATEGY[3], one_of = CACHE_KEY_STRATEGY, len_min = 0, required = false, description = "Specifies the cache key strategy (client id with user identifier, JWT ID (jti) claim, JWT signature). Defaults to JWT signature." }, },
           { user_identifier_claim = { type = "string", default = "oid", len_min = 0, required = false, description = "Token claim that uniquely identifies a user (part of the cache key). Defaults to oid." }, },
           { ttl = { type = "number", default = 180, required = false, description = "Token cache ttl (time-to-live) specifies the expiration time (sec). Defaults to 180 sec." }, },
           { enable_factor_ttl = { type = "boolean", default = false, required = false, description = "Activate, if the token cache ttl (time-to-live) should be calculated based on the AAD expiration time multiplied by a factor " }, },
@@ -95,7 +148,8 @@ return {
           { event_marker_siem = { type = "string", default = "SiemEventLoggingListener", required = false, description = "SIEM (Security Information and Event Management) marker added on logging." } },
           { stopwatch = { type = "boolean", default = false, required = false, description = "Active, if runtime of the plugin should be be measured (msec)." } },
         },
-        custom_validator = validate_resource_scope,
+
+        custom_validator = validate,
       },
     },
   },

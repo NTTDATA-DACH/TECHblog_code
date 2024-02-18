@@ -23,32 +23,25 @@ welcher Art auch immer haftbar zu machen.
 
   note:
   - MS OBO: https://learn.microsoft.com/en-us/azure/active-directory/develop/v2-oauth2-on-behalf-of-flow
+  - Kong Caching - https://docs.konghq.com/gateway/latest/plugin-development/entities-cache/
 
 --]]
 
+local log = require "kong.plugins.oauth2-on-behalf-of.log"
+
+local bearer = require "kong.plugins.oauth2-on-behalf-of.bearer"
+local token = require "kong.plugins.oauth2-on-behalf-of.token"
+local jwt = require "kong.plugins.oauth2-on-behalf-of.jwt"
+
 local cert_utils = require "kong.enterprise_edition.cert_utils"
-local jwt_parser = require "kong.plugins.jwt.jwt_parser"
 
-local xml = require "xmlua.xml"
-
-local http = require "resty.http"
 local url = require "net.url"
+local http = require "resty.http"
 
 local cjson_safe = require "cjson.safe"
 
 local pl_url = require "pl.url"
 local pl_pretty = require "pl.pretty"
-local pl_stringx = require "pl.stringx"
-
---[[ enable, if log chunking is desired
-local chunk_utils = require 'kong.modules.chunk_utils'
-local chunker = chunk_utils.chunker
---]]
-
-local rep = string.rep
-
-local encode_base64 = ngx.encode_base64
-local decode_base64 = ngx.decode_base64
 
 local kong = kong
 
@@ -56,42 +49,38 @@ local ngx_now = ngx.now
 local ngx_update_time = ngx.update_time
 local ngx_http_time = ngx.http_time
 
-local PLUGIN_VERSION = "1.0.0"
+local PLUGIN_VERSION = "1.0.1"
 local PLUGIN_PRIORITY = 800
 local PLUGIN_NAME = "oauth2-on-behalf-of"
 
 local LOG_HIGHLIGHT_PREFIX = '################### '
-local LOG_LEVEL_DEBUG = 'debug'
-local LOG_LEVEL_INFO = 'info'
 
 local CACHE_KEY = "OnBehalfOfKey"
+local CACHE_KEY_STRATEGY_JWT_ID = "JWT_ID"
+local CACHE_KEY_STRATEGY_JWT_SIGNATURE = "JWT_SIGNATURE"
+local CACHE_KEY_STRATEGY_CLIENT_ID_USER_IDENTIFIER = "CLIENT_ID_USER_IDENTIFIER"
 
-local BEARER_PREFIX = "Bearer "
 local AUTHORIZATION = "Authorization"
+local KONG_OAUTH2_OBO_CACHE_REMAINING_TTL = "X-Kong-OAuth2-OBO-Cache-Remaining-TTL"
 
-local TOKEN_TYPE_JWT = "jwt"
-local TOKEN_TYPE_SAML1 = "saml1"
-local TOKEN_TYPE_SAML2 = "saml2"
+local JTI_CLAIM = "jti"
 
-local HTTP_CODE_401_UNAUTHORIZED = 401
 local HTTP_CODE_500_INTERNAL_SERVER_ERROR = 500
 local HTTP_CODE_502_BAD_GATEWAY = 502
-
-local LOG_REDACTED = 'REDACTED4SECURITY'
 
 local EPOCH_SEC = false
 local EPOCH_MSEC = true
 
 
 --[[
-  get the time in seconds or milliseconds (needed for stowatch) 
+  get the time in seconds or milliseconds (needed for stowatch)
   @param ms defines time unit return (true=MSEC, false=SEC)
   @return time in seconds or milliseconds
 --]]
 local function now(ms)
   ngx_update_time()
 
-  -- floating-point number for the elapsed time in seconds (including milliseconds as the decimal part) 
+  -- floating-point number for the elapsed time in seconds (including milliseconds as the decimal part)
   local ngxNow = ngx_now()
 
   if (ms) then
@@ -99,52 +88,8 @@ local function now(ms)
   else
     ngxNow = math.floor(ngxNow)
   end
-   
+
   return ngxNow
-end
-
-
---[[
-  check, if Kong is on debug logging 
-  @return debug true/false
---]]
-local function onDebug()
-  local LOG_LEVEL_DEBUG ='debug'
-  local logLevel = kong.configuration.log_level
-
-  -- return ((logLevel ~= nil) and (string.lower(logLevel) == LOG_LEVEL_DEBUG))
-  return false
-end
-
-
---[[
-  base 64 encoding based on ngx functions
-  @param input String to base64 encode
-  @return Base64 encoded string
---]
-local function base64_encode(input)
-  local result = encode_base64(input, true)
-  result = result:gsub("+", "-"):gsub("/", "_")
-
-  return result
-end
-
-
---[[
-  base 64 decode based on ngx functions
-  @param input String to base64 decode
-  @return Base64 decoded string
---]]
-local function base64_decode(input)
-  local remainder = #input % 4
-
-  if remainder > 0 then
-    local padlen = 4 - remainder
-    input = input .. rep("=", padlen)
-  end
-
-  input = input:gsub("-", "+"):gsub("_", "/")
-  return decode_base64(input)
 end
 
 
@@ -176,31 +121,8 @@ end
 
 
 --[[
-  getRequestedTokenType
-  @param conf the kong plugin configuration  
-  @return token type string
---]]
-local function getRequestedTokenType(conf)
-  local requestedTokenType=TOKEN_TYPE_JWT
-
-  -- requested_token_type is schema one_of validator checked
-  if (conf.requested_token_type) then
-    local tokenTypeParts = pl_stringx.split(conf.requested_token_type,':')
-    
-    if (tokenTypeParts) then
-      requestedTokenType = tokenTypeParts[#tokenTypeParts] 
-    end
-  end
-
-  kong.log.debug("requestedTokenType: ", requestedTokenType)
-
-  return requestedTokenType
-end
-
-
---[[
   buildPayload for the on-behalf-of grant type
-  @param conf the kong plugin configuration  
+  @param conf the kong plugin configuration
   @return payload string
 --]]
 local function buildPayload(conf,assertionToken)
@@ -212,10 +134,8 @@ local function buildPayload(conf,assertionToken)
   payload = payload .. "&assertion=" .. assertionToken                          -- the access token that was sent to the middle-tier API. This token must have an audience (aud) claim of the app making this OBO request (the app denoted by the client-id field)
   payload = payload .. "&requested_token_use=on_behalf_of"                      -- specifies how the request should be processed (in the OBO flow, the value must be set to on_behalf_of)
 
-  local requestedTokenType = getRequestedTokenType(conf)
-
   -- add requestedTokenType parameter only for SAML, JWT is default anyway
-  if ((requestedTokenType==TOKEN_TYPE_SAML1) or (requestedTokenType==TOKEN_TYPE_SAML2)) then
+  if ((token:isTokenTypeSAML1(conf.requested_token_type)) or (token:isTokenTypeSAML2(conf.requested_token_type))) then
     payload = payload .. "&requested_token_type=" .. conf.requested_token_type  -- specifies the type of token requested (urn:ietf:params:oauth:token-type:saml1 or urn:ietf:params:oauth:token-type:saml2)
   end
 
@@ -224,20 +144,20 @@ local function buildPayload(conf,assertionToken)
   end
 
   local scopeStr = buildScopeStr(conf)
-  
+
   if (scopeStr) then
     payload = payload .. "&scope=" .. pl_url.quote(scopeStr) -- v2 endpoint, space separated list of scopes for the token request
   end
 
   kong.log.debug("payload: ", payload)
-   
+
   return payload
 end
 
 
 --[[
-  on-behalf-of flow to retrieve a valid access token 
-  @param conf the kong plugin configuration  
+  on-behalf-of flow to retrieve a valid access token
+  @param conf the kong plugin configuration
   @param assertionToken the assertion token
   @return accessToken (handle exits because error return has been difficult with caching)
 
@@ -269,7 +189,7 @@ local function doOnBehalfOfFlow(conf, assertionToken)
   if (conf.enable_siem) then
     siemEventMarker = conf.event_marker_siem
   end
-  
+
   local httpc = http.new()
 
   if (conf.timeout) then
@@ -301,7 +221,7 @@ local function doOnBehalfOfFlow(conf, assertionToken)
       kong.log.err(HTTP_CODE_500_INTERNAL_SERVER_ERROR, ", ", "client certificate enabled, but no client certificate configured", " ", siemEventMarker)
       kong.response.exit(HTTP_CODE_500_INTERNAL_SERVER_ERROR, "client certificate enabled, but no client certificate configured")
     end
-    
+
     -- check that cdata pointer is different from nil 
     if ((not(ssl_client_cert)) or (not (ssl_client_priv_key))) then
       kong.log.err(HTTP_CODE_500_INTERNAL_SERVER_ERROR, ", ", "load certificate [" .. ssl_err .. "]", " ", siemEventMarker)
@@ -313,7 +233,7 @@ local function doOnBehalfOfFlow(conf, assertionToken)
 
     local u = url.parse(conf.token_endpoint)
     ssl_server_name = u.host
- 
+
     kong.log.debug("ssl_server_name: ", ssl_server_name)
   end
 
@@ -331,10 +251,10 @@ local function doOnBehalfOfFlow(conf, assertionToken)
     ssl_server_name = ssl_server_name,
     ssl_client_cert = ssl_client_cert,
     ssl_client_priv_key = ssl_client_priv_key,
-  })  
+  })
 
   -- connection pool seems to be closed
-  if (onDebug()) then
+  if (log:debugging()) then
     local reused_times, reused_err = httpc:get_reused_times()
 
     if (not(reused_times)) then
@@ -350,9 +270,9 @@ local function doOnBehalfOfFlow(conf, assertionToken)
     kong.log.err(HTTP_CODE_502_BAD_GATEWAY, ", ", http_err_msg .. ": [" .. http_err .. "]", " ", siemEventMarker)
     kong.response.exit(HTTP_CODE_502_BAD_GATEWAY, http_err_msg .. ": [" .. http_err .. "]")
   end
-  
+
   local success = (http_res.status < 400)
-  
+
   if (not(success)) then
     if (http_res.body) then
       local fault = { msg = http_err_msg }
@@ -381,7 +301,7 @@ local function doOnBehalfOfFlow(conf, assertionToken)
     kong.log.err(HTTP_CODE_502_BAD_GATEWAY, ", ", http_err_msg .. ": [" .. http_res.status .. "]", " ", siemEventMarker)
     kong.response.exit(HTTP_CODE_502_BAD_GATEWAY, http_err_msg .. ": [" .. http_res.status .. "]")
   end
-  
+
   if (not (http_res.body)) then
     kong.log.err(HTTP_CODE_502_BAD_GATEWAY, ", ", "no response body", " ", siemEventMarker)
     kong.response.exit(HTTP_CODE_502_BAD_GATEWAY, "no response body")
@@ -396,7 +316,7 @@ local function doOnBehalfOfFlow(conf, assertionToken)
   end
 
   accessToken = json_value.access_token
-  
+
   if (not(accessToken)) then
     kong.log.err(pl_pretty.write(http_res.body,"",false))
     kong.log.err(HTTP_CODE_502_BAD_GATEWAY, ", ", "no access token", " ", siemEventMarker)
@@ -427,7 +347,11 @@ local function doOnBehalfOfFlow(conf, assertionToken)
     kong.log.debug("token expires in: ", expires_in, " sec")
     kong.log.debug("token cache item ttl: ", ttl, " sec")
 
-    kong.log.debug("token cached until (UTC): ", ngx_http_time(now(EPOCH_SEC)+ttl)) 
+    kong.log.debug("token cached until (UTC): ", ngx_http_time(now(EPOCH_SEC)+ttl))
+  end
+
+  if (log:debugging() and (ttl)) then
+    kong.response.set_header(KONG_OAUTH2_OBO_CACHE_REMAINING_TTL, ttl)
   end
 
   return accessToken, err, ttl
@@ -435,264 +359,79 @@ end
 
 
 --[[
-  get request authorization header
-  return authorization header or error table 
---]]
-local function getAuthorizationHeader()
-  -- get authorization header from request  
-  local authorization = kong.request.get_header(AUTHORIZATION)
-
-  if not authorization then
-    return nil, { message = "missing " .. AUTHORIZATION .. " header" }
-  end
-
-  return authorization, nil 
-end
-
-
---[[
-  check whether the autorization header is of type bearer  
-  @return true or false (bearer token or not not bearer token)
---]]
-local function isAuthorizationHeaderTypeBearer(authorization)
-  local isBearer = false
-
-  if (authorization ~= nil) then
-    isBearer = pl_stringx.startswith(string.lower(authorization),string.lower(BEARER_PREFIX))
-  end
-
-  return isBearer 
-end
-
-
---[[
-  check whether the autorization header has a valid bearer token structure 
-  @return true or false (valid bearer token structure)
---]]
-local function isAuthorizationHeaderBearerValid(authorization)
-  local isValidBearer = false
-
-  if (authorization ~= nil) then
-    if not (pl_stringx.startswith(string.lower(authorization),string.lower(BEARER_PREFIX))) then
-      return false, { message = "missing bearer prefix" }
-    end
-
-    if not (pl_stringx.count(authorization,'.')==2) then
-      return false, { message = "token does not have exact three dot-delimited parts" }
-    end
-
-    if not (pl_stringx.count(authorization,' ')==1) then
-      return false, { message = "token does only allow a space between bearer prefix and dot-delimited parts" }
-    end
-
-    isValidBearer = true
-  end
-
-  return isValidBearer, nil
-end
-
-
---[[
-  get request jwt from request header and check structural integrity
-  return jwt or error table 
---]]
-local function getJWT()
-  -- get authorization header from request  
-  local authorization, err = getAuthorizationHeader()
-
-  if (err) then
-    kong.log.err("Unauthorized; " .. err.message)
-    return nil, { status = 401, message = "Unauthorized; " .. err.message }
-  end
-
-  if (not(isAuthorizationHeaderTypeBearer(authorization))) then
-    kong.log.err("Unauthorized; " .. AUTHORIZATION .. " is not type bearer")
-    return nil, { status = 401, message = "Unauthorized; " .. AUTHORIZATION .. " is not type bearer" }
-  end
-
-  -- check bearer token for structural validity 
-  local checkResult, checkErr = isAuthorizationHeaderBearerValid(authorization)
-
-  if (checkErr) then
-     kong.log.err("Unauthorized; " .. checkErr.message)
-     return nil, { status = 401, message = "Unauthorized; " .. checkErr.message }
-  end
-
-  -- trim bearer prefix with sub (upper/lower case)
-  local jsonWebToken = string.sub(authorization, string.len(BEARER_PREFIX)+1)
-
-  return jsonWebToken, nil
-end
-
-
---[[
-  conformity check on access token 
-  @param conf the kong plugin configuration  
-  @param token the access token
-  @return true/false
---]]
-local function doJWTConformityCheck(conf,token)
-  local siemEventMarker = ""
-
-  if (conf.enable_siem) then
-    siemEventMarker = conf.event_marker_siem
-  end
-
-  -- check on base64 parts existence <header_64>.<payload_64>.<signature_64>
-  -- check base64 decoding validity of base64 parts
-  -- secured token must have header parameter alg which must be supported (HS256, HS384, HS512, RS256, RS384, RS512, ES256, ES384)
-  local jsonWebToken, err = jwt_parser:new(token)
-
-  if (err) then
-    kong.log.err(HTTP_CODE_500_INTERNAL_SERVER_ERROR, ", ", "invalid jwt token [" .. err .. "]", " ", siemEventMarker)
-    kong.response.exit(HTTP_CODE_500_INTERNAL_SERVER_ERROR, "invalid jwt token [" .. err .. "]")
-  end 
-
-  kong.log.debug("token header: ", pl_pretty.write(jsonWebToken.header,"",false))
-  kong.log.debug("token payload: ", pl_pretty.write(jsonWebToken.claims,"",false))
-
-  return true
-end
-
-
---[[
-  do conformity check
-  @param conf the kong plugin configuration  
-  @param token SAML1 or SAML2 token
-  @return true/false
---]]
-local function doSAMLConformityCheck(conf,token)
-  local siemEventMarker = ""
-
-  if (conf.enable_siem) then
-    siemEventMarker = conf.event_marker_siem
-  end
-
-  local samlXML = base64_decode(token)
-
-  if (samlXML) then
-    local success, samlDoc = pcall(xml.parse,samlXML)
-
-    if (not(success)) then
-      local err = samlDoc 
-
-      kong.log.err(HTTP_CODE_500_INTERNAL_SERVER_ERROR, ", ", "invalid saml token [" .. err .. "]", " ", siemEventMarker)
-      kong.response.exit(HTTP_CODE_500_INTERNAL_SERVER_ERROR, "invalid saml token [" .. err .. "]")
-    end
-  end
-
-  return true
-end
-
-
---[[
   conformity check
-  @param conf the kong configuration
-  @param token
-  @return print secure token
+  @param conf > the kong configuration
+  @param uncheckedToken > the security token
+  @return true/false, error message
 --]]
-local function conformityCheck(conf,token)
-  local requestedTokenType = getRequestedTokenType(conf)
-
-  kong.log.debug('requestedTokenType: ', requestedTokenType)
-  kong.log.debug('token: ', token)
-
-  if (conf.enable_conformity_check) then
-    if (requestedTokenType==TOKEN_TYPE_JWT) then
-      doJWTConformityCheck(conf,token)
-    end
-
-    if ((requestedTokenType==TOKEN_TYPE_SAML1) or (requestedTokenType==TOKEN_TYPE_SAML2)) then
-      doSAMLConformityCheck(conf,token)
-    end
-  end
-
-  return true
-end
-
-
---[[
-  remove JWT token signature
-  @param token JWT token
-  @return secure token without signature for printing
---]]
-local function jwtRemoveSignature(token)
-  local revBearerToken = token:reverse()
-  return bearerToken:sub(1,#revBearerToken-revBearerToken:find('.',1,true)) .. '.' .. LOG_REDACTED
-end
-
-
---[[
-  remove SAML token signature
-  @param token SAML token
-  @return secure token without signature for printing
-  note:
-  - saml parser: https://samltool.io/
-  - xml processing tutorial: https://clear-code.github.io/xmlua/tutorial/
---]]
-local function samlRemoveSignature(token)
-  local tokenWithoutSignature= ""
-
-  local samlXML = base64_decode(token)
-
-  if (samlXML) then
-    local samlDoc = xml.parse(samlXML)
-
-    local signatureNS = {
-      {
-        prefix = "signature",
-        href = "http://www.w3.org/2000/09/xmldsig#",
-      }
-    }
-
-    local signatureNoteSet = samlDoc:search("//signature:Signature",signatureNS)
-
-    -- signatureNoteSet:unlink() 
-    signatureNoteSet[1]:set_content("Signature " .. LOG_REDACTED)
-
-    tokenWithoutSignature= ngx.encode_base64(samlDoc:to_xml())
-  end
-
-  return tokenWithoutSignature
+local function conformityCheck(conf,uncheckedToken)
+  local valid, errorMsg = token:conformityCheck(uncheckedToken,conf.requested_token_type)
+  return valid, errorMsg
 end
 
 
 --[[
   security aware token output
-  @param conf the kong plugin configuration
-  @param token the security token
+  @param conf > the kong plugin configuration
+  @param unsafeToken > the security token
   @return log token (secure because unusable due to signature removal)
 --]]
-local function logTokenSecurityAware(conf,token)
-  local requestedTokenType = getRequestedTokenType(conf)
-
-  if (onDebug()) then
-    kong.log.debug('bearer token:', token)
-  else
-    local securityAwareToken = ''
-
-    -- remove signature for security reasons
-    if (requestedTokenType==TOKEN_TYPE_JWT) then
-      securityAwareToken = jwtRemoveSignature(token)
-    end
-
-    if ((requestedTokenType==TOKEN_TYPE_SAML1) or (requestedTokenType==TOKEN_TYPE_SAML2)) then
-      securityAwareToken = samlRemoveSignature(token)
-    end
-
-    kong.log.notice('bearer token:', securityAwareToken)
-    -- chunker.logChunks(kong.log.notice,'bearer token:', securityAwareToken)
-  end
+local function logTokenSecurityAware(conf,unsafeToken)
+  local LOG_PREFIX = "bearer token: "
+  log:tokenLoggingSecurityAware(LOG_PREFIX,unsafeToken,conf.requested_token_type)
 end
 
 
 --[[
-  build bearer header
-  @param accessToken
-  @return bearer token
+  build cache key
+  @param accessToken > access token
+  @return cache key
 --]]
-local function buildBearerHeader(accessToken)
-  return BEARER_PREFIX .. accessToken
+local function buildCacheKey(conf, assertionToken)
+  local cacheKey = nil
+
+  if (conf.cache_key_strategy==CACHE_KEY_STRATEGY_CLIENT_ID_USER_IDENTIFIER) then
+    -- cache key needs an unique user identifier, Keycloak/AAD = preferred_username, AAD = oid (better than preferred_username)
+    local userIdentifier, userIdentifierErr = jwt:claimValue(assertionToken,conf.user_identifier_claim)
+
+    if (userIdentifierErr) then
+      kong.log.err(userIdentifierErr.status,userIdentifierErr.message)
+      return nil, { status = userIdentifierErr.status, message = userIdentifierErr.message }
+    end
+
+    -- does the cache key also need the recipients that the JWT is intended for (e.g. aud)? taken out for now.
+    cacheKey = CACHE_KEY .. "#" .. conf.client_id .. "#" .. userIdentifier
+  end
+
+  if (conf.cache_key_strategy==CACHE_KEY_STRATEGY_JWT_ID) then
+    -- cache key needs an jwt id
+    -- note: AAD JWT ver 1.0 tokens do not provide jti claims
+    local jti, jtiErr = jwt:claimValue(assertionToken,JTI_CLAIM)
+
+    if (jtiErr) then
+      kong.log.err(jtiErr.status,jtiErr.message)
+      return nil, { status = jtiErr.status, message = jtiErr.message }
+    end
+
+    cacheKey = CACHE_KEY .. "#" .. jti
+  end
+
+  if (conf.cache_key_strategy==CACHE_KEY_STRATEGY_JWT_SIGNATURE) then
+    -- cache key needs an jwt signature
+    local jwtSignature, jwtSignatureErr = jwt:signature(assertionToken)
+
+    if (jwtSignatureErr) then
+      kong.log.err(jwtSignatureErr.status,", ",jwtSignatureErr.message)
+      return nil, { status = jwtSignatureErr.status, message = jwtSignatureErr.message }
+     end
+
+    -- does the cache key also need the recipients that the JWT is intended for (e.g. aud)? taken out for now.
+    cacheKey = CACHE_KEY .. "#" .. jwtSignature
+  end
+
+  kong.log.debug("cacheKey: ",cacheKey)
+
+  return cacheKey, nil
 end
 
 
@@ -727,6 +466,7 @@ local function logConf(conf)
   -- additional configuration
   kong.log.debug('conf.keep_original_token: ', conf.keep_original_token)
   kong.log.debug('conf.enable_caching: ', conf.enable_caching)
+  kong.log.debug('conf.cache_key_strategy: ', conf.cache_key_strategy)
   kong.log.debug('conf.user_identifier_claim: ', conf.user_identifier_claim)
   kong.log.debug('conf.ttl: ', conf.ttl, ' sec')
   kong.log.debug('conf.enable_factor_ttl: ', conf.enable_factor_ttl)
@@ -746,10 +486,8 @@ local OAuth2OnBehalfOfHandler = {
 }
 
 --[[
-  plugin handler for the ngx access phase 
+  plugin handler for the ngx access phase
   @param conf the kong plugin configuration
-  note:
-  Kong Caching - https://docs.konghq.com/gateway/latest/plugin-development/entities-cache/
 --]]
 function OAuth2OnBehalfOfHandler:access(conf)
   local startTimeMS = now(EPOCH_MSEC)
@@ -757,49 +495,36 @@ function OAuth2OnBehalfOfHandler:access(conf)
   kong.log.debug(LOG_HIGHLIGHT_PREFIX .. PLUGIN_NAME .. ' plugin enabled - access')
   logConf(conf)
 
-  local accessToken = ""
-  local accessTokenErr = {}
+  local assertionToken, assertionTokenErr = bearer:token()
 
-  local assertionToken, assertionTokenErr = getJWT()  
-    
   if (assertionTokenErr) then
     return kong.response.exit(assertionTokenErr.status, { message = assertionTokenErr.message })
   end
 
   kong.log.debug("assertion token: ", assertionToken)
 
+  local accessToken = ""
+  local accessTokenErr = {}
+
   if (conf.enable_caching) then
-    -- get the assertion token claims 
-    local assertionTokenParsed, assertionTokenParsedErr = jwt_parser:new(assertionToken)
+    local cacheKey, cacheKeyErr = buildCacheKey(conf, assertionToken)
 
-    if (assertionTokenParsedErr) then
-      kong.log.err("Bad assertion token; " .. tostring(assertionTokenParsedErr))
-      return kong.response.exit(401, { message = "Unauthorized; bad token; " .. tostring(assertionTokenParsedErr) })
-    end 
-
-    kong.log.debug("assertion token parsed: ", pl_pretty.write(assertionTokenParsed.claims,"",false))
-
-    -- cache key needs an unique user identifier, Keycload/AAD = preferred_username, AAD = oid (better than preferred_username)
-    local user_identifier = assertionTokenParsed.claims[conf.user_identifier_claim]
-
-    if ((not(user_identifier)) and (#user_identifier>0)) then
-      return kong.response.exit(HTTP_CODE_401_UNAUTHORIZED, { message = "no valid user identifier at claim " .. conf.user_identifier_claim })
+    if (cacheKeyErr) then
+      return kong.response.exit(cacheKeyErr.status, { message = cacheKeyErr.message } )
     end
 
-    -- does the cache key also need the recipients that the JWT is intended for (e.g. aud)? taken out for now.
-    local cacheKey = CACHE_KEY .. "#" .. conf.client_id .. "#" .. user_identifier
-
-    if (onDebug()) then
+    -- for debugging purposes: cache control (plugin development only)
+    if (log:debugging()) then
       local remaining_ttl, err, value = kong.cache:probe(cacheKey)
 
       if (value) then
         kong.log.debug("cacheKey: ", cacheKey, " remaining ttl: ", remaining_ttl, " sec")
+        kong.response.set_header(KONG_OAUTH2_OBO_CACHE_REMAINING_TTL, remaining_ttl)
       else
          kong.log.debug("cacheKey: ", cacheKey, " not yet included in the cache")
       end
     end
 
-    -- https://docs.konghq.com/gateway/latest/plugin-development/entities-cache/#cache-custom-entities
     accessToken, accessTokenErr = kong.cache:get(cacheKey, { ttl = conf.ttl }, doOnBehalfOfFlow, conf, assertionToken)
 
     if (accessTokenErr) then
@@ -812,19 +537,27 @@ function OAuth2OnBehalfOfHandler:access(conf)
   kong.log.debug('access token: ', accessToken)
 
   if (conf.enable_conformity_check) then
-    conformityCheck(conf,accessToken)
+    local checkRes, checkErr = conformityCheck(conf,accessToken)
+
+    if (checkErr) then
+      kong.log.err(HTTP_CODE_500_INTERNAL_SERVER_ERROR, ", ", pl_pretty.write(checkErr,"",false))
+      return kong.response.exit(HTTP_CODE_500_INTERNAL_SERVER_ERROR, { message = checkErr.message })
+    end
+
+    kong.log.debug("token conformity check: ", checkRes)
   end
 
-  -- logging: remove signature and thereby invalidate the token if the log level is other than debug 
+  -- logging: remove signature and thereby invalidate the token if the log level is other than debug (prevent replay attacks)
   logTokenSecurityAware(conf,accessToken)
 
   if (conf.keep_original_token) then
-    kong.service.request.clear_header('original_' .. AUTHORIZATION)
-    kong.service.request.set_header('original_' .. AUTHORIZATION, buildBearerHeader(assertionToken))
+    kong.service.request.clear_header('original_obo_' .. AUTHORIZATION)
+    kong.service.request.set_header('original_obo_' .. AUTHORIZATION, bearer:buildBearerHeader(assertionToken))
+    kong.log.debug("set request header: ", 'original_obo_' .. AUTHORIZATION, " = ", bearer:buildBearerHeader(assertionToken))
   end
-  
+
   kong.service.request.clear_header(AUTHORIZATION)
-  kong.service.request.set_header(AUTHORIZATION, buildBearerHeader(accessToken))
+  kong.service.request.set_header(AUTHORIZATION, bearer:buildBearerHeader(accessToken))
 
   kong.log.notice(PLUGIN_NAME, ": OBO successfully executed, proxying towards upstream")
 

@@ -27,7 +27,7 @@ welcher Art auch immer haftbar zu machen.
 --]]
 
 package = "oauth2-on-behalf-of"
-version = "1.0.0"
+version = "1.0.1"
 supported_platforms = {"linux", "macosx"}
 source = {
   url = "",
