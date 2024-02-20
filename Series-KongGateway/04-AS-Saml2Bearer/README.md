@@ -7,4 +7,4 @@ The plugin code is proxy-aware and can seamlessly adapted to proxy settings. Als
 
 New to Kong plugin coding? It's best to start with the Kong introduction "Develop Custom Plugins" [here] https://docs.konghq.com/gateway/latest/plugin-development/
 
-For more details read the full article (to be published).
+For more details read the full article [here](https://nttdata-dach.github.io/posts/as-konggateway-saml2bearer/).
